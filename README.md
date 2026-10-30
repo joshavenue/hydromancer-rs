@@ -46,7 +46,7 @@ async fn main() -> Result<(), hydromancer::Error> {
 
 `Client::new("key")` takes the key directly, and `Client::builder()` sets the base URL,
 User-Agent, timeout and retry policy. Base URLs must use `https` (plain `http` is accepted only
-for `localhost`, for local testing).
+for loopback hosts such as `localhost` or `127.0.0.1`, for local testing).
 
 ## Endpoints
 
@@ -56,7 +56,7 @@ These have typed helpers:
 | Method | Request `type` |
 |---|---|
 | `clearinghouse_state`, `clearinghouse_state_on_dex`, `clearinghouse_state_all_dexes` | `clearinghouseState` |
-| `batch_clearinghouse_states` (up to 1,000 users), `..._on_dex`, `..._all_dexes` (up to 100 users) | `batchClearinghouseStates` |
+| `batch_clearinghouse_states`, `batch_clearinghouse_states_on_dex` (up to 1,000 users each), `batch_clearinghouse_states_all_dexes` (up to 100 users) | `batchClearinghouseStates` |
 | `user_fills_by_time`, `user_fills_pages` | `userFillsByTime` |
 | `liquidation_history_by_time` | `liquidationHistoryByTime` |
 | `candle_snapshot` | `candleSnapshot` |
@@ -81,7 +81,8 @@ async fn main() -> Result<(), hydromancer::Error> {
 }
 ```
 
-Binary snapshot endpoints such as `perpSnapshots` return MessagePack, not JSON, and are not decoded by this crate.
+Binary snapshot endpoints such as `perpSnapshots` return MessagePack, not JSON; this crate does not decode them,
+and `info` returns `Error::Decode` for them.
 
 ## Paging through fills
 
@@ -145,10 +146,11 @@ Each key has a per-minute weight budget, and heavier endpoints cost more weight
 On HTTP 429 the client waits and retries, up to 3 times by default. Each wait is the `Retry-After`
 header (seconds or an HTTP date), or the body's `retryAfterSecs`, or exponential backoff from
 1 second capped at 30 seconds, plus up to 1 second of random jitter. All attempts and waits share a
-90-second budget: a wait that would not fit is not attempted, and a request still running when the
-budget ends is cancelled. When retries run out you get `Error::RateLimited` with the server's
+90-second budget: if the next wait would not fit, the client stops and returns `Error::RateLimited`, and a request
+still running when the budget ends is cancelled. When retries run out you get `Error::RateLimited` with the server's
 `remaining`, `required` and `correlationId`; a request cut off by the budget gives `Error::Timeout`.
-Other errors are not retried. Change this with `ClientBuilder::retry_policy` or `max_retries`.
+Other HTTP errors and transport failures are not retried. Change this with `ClientBuilder::retry_policy`
+or `max_retries`. Each HTTP attempt also has its own 60-second timeout (`ClientBuilder::timeout`).
 
 ## Testnet
 
@@ -160,7 +162,7 @@ fn main() -> Result<(), hydromancer::Error> {
 }
 ```
 
-Your key needs testnet access; a 401 on testnet means it is not enabled for that key.
+Your key needs testnet access; a 401 on testnet usually means testnet is not enabled for that key.
 
 ## API key handling
 
@@ -168,7 +170,7 @@ The key is read from `HYDROMANCER_API_KEY` or passed in code and sent as an `Aut
 header to `{base URL}/info`, marked sensitive in the header map. The built-in HTTP client does not
 follow redirects; if you pass your own `reqwest::Client` with `http_client`, configure it with
 `redirect::Policy::none()` as well. `Debug` output and the crate's own error messages never include
-the key, and it is masked if a server response echoes it back.
+the key, and if a server echoes the key back in an error response, it is replaced with `<redacted>`.
 
 Every request carries a `User-Agent` (`hydromancer-rs/<version>` by default), because the API rejects
 some default HTTP-library agents with HTTP 403 "error code: 1010".
