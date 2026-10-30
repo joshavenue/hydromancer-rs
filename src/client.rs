@@ -207,12 +207,10 @@ impl ClientBuilder {
                 "{raw}: must not contain credentials, a query or a fragment"
             )));
         }
+        let path = info_url.path().trim_end_matches('/').to_owned();
+        info_url.set_path(&path);
         let base_url = info_url.as_str().trim_end_matches('/').to_owned();
-        info_url
-            .path_segments_mut()
-            .map_err(|_| Error::InvalidBaseUrl(format!("{raw}: cannot be a base URL")))?
-            .pop_if_empty()
-            .push("info");
+        info_url.set_path(&format!("{path}/info"));
 
         let ua = self.user_agent.trim();
         if ua.is_empty() {
@@ -300,8 +298,8 @@ impl Client {
         let body =
             serde_json::to_vec(body).map_err(|e| Error::InvalidRequest(format!("body is not serializable: {e}")))?;
         let bytes = self.post(body).await?;
-        serde_json::from_slice(&bytes).map_err(|source| Error::Decode {
-            source,
+        serde_json::from_slice(&bytes).map_err(|e| Error::Decode {
+            message: redact(e.to_string(), &self.inner.key),
             body: redact(snippet(&bytes), &self.inner.key),
         })
     }
@@ -491,7 +489,6 @@ impl Client {
         let started = Instant::now();
         let deadline = started.checked_add(policy.budget).map(tokio::time::Instant::from_std);
         let mut attempts: u32 = 0;
-        let mut last_rate_limit: Option<Error> = None;
         loop {
             attempts += 1;
             let attempt = async {
@@ -513,11 +510,7 @@ impl Client {
             let outcome = match deadline {
                 Some(deadline) => match tokio::time::timeout_at(deadline, attempt).await {
                     Ok(outcome) => outcome,
-                    Err(_) => {
-                        return Err(last_rate_limit
-                            .take()
-                            .unwrap_or(Error::Timeout { budget: policy.budget }))
-                    }
+                    Err(_) => return Err(Error::Timeout { budget: policy.budget }),
                 },
                 None => attempt.await,
             };
@@ -532,21 +525,19 @@ impl Client {
 
             let rl = RateLimitBody::parse(&bytes);
             let hint = retry_after_header(&headers, SystemTime::now()).or_else(|| rl.retry_after());
-            let error = Error::RateLimited {
-                attempts,
-                retry_after: hint,
-                remaining: rl.remaining,
-                required: rl.required,
-                limit: header_u64(&headers, "x-ratelimit-limit"),
-                correlation_id: rl.correlation_id.map(|id| redact(id, &inner.key)),
-            };
             let retry = attempts - 1;
             let wait = policy.wait(hint, retry).saturating_add(policy.jitter());
             let remaining = policy.budget.saturating_sub(started.elapsed());
             if retry >= policy.max_retries || wait > remaining {
-                return Err(error);
+                return Err(Error::RateLimited {
+                    attempts,
+                    retry_after: hint,
+                    remaining: rl.remaining,
+                    required: rl.required,
+                    limit: header_u64(&headers, "x-ratelimit-limit"),
+                    correlation_id: rl.correlation_id.map(|id| redact(id, &inner.key)),
+                });
             }
-            last_rate_limit = Some(error);
             tokio::time::sleep(wait).await;
         }
     }
@@ -763,6 +754,13 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(c.inner.info_url.as_str(), "https://proxy.example/hl/info");
+        let c = Client::builder()
+            .api_key("k")
+            .base_url("https://proxy.example/hl//")
+            .build()
+            .unwrap();
+        assert_eq!(c.inner.info_url.as_str(), "https://proxy.example/hl/info");
+        assert_eq!(c.base_url(), "https://proxy.example/hl");
         for bad in [
             "http://api.example.com",
             "https://user:pw@api.example.com",

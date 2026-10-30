@@ -352,6 +352,15 @@ async fn decode_errors_keep_a_body_snippet() {
         .await;
     let err = client(&server).clearinghouse_state(USER).await.unwrap_err();
     assert!(matches!(err, Error::Decode { ref body, .. } if body == "not json"));
+
+    // A decode error message must not carry an echoed key either.
+    let server = MockServer::start().await;
+    Mock::given(path("/info"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"marginSummary": KEY})))
+        .mount(&server)
+        .await;
+    let err = client(&server).clearinghouse_state(USER).await.unwrap_err();
+    assert!(!format!("{err} {err:?}").contains(KEY), "{err:?}");
 }
 
 /// Returns 429 for the first `fail` requests, then 200.
@@ -612,7 +621,7 @@ async fn budget_bounds_slow_responses() {
 }
 
 #[tokio::test]
-async fn slow_retry_after_429_returns_the_rate_limit_error() {
+async fn slow_retry_after_429_times_out() {
     let server = MockServer::start().await;
     Mock::given(path("/info"))
         .respond_with(SlowAfter429 {
@@ -630,10 +639,7 @@ async fn slow_retry_after_429_returns_the_rate_limit_error() {
         .build()
         .unwrap();
     let err = c.info(&json!({"type": "x"})).await.unwrap_err();
-    assert!(
-        matches!(err, Error::RateLimited { attempts: 1, ref correlation_id, .. } if correlation_id.as_deref() == Some("C1")),
-        "{err:?}"
-    );
+    assert!(matches!(err, Error::Timeout { .. }), "{err:?}");
 }
 
 struct SlowAfter429 {

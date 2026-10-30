@@ -84,12 +84,11 @@ pub enum Error {
     },
 
     /// The response body was not the JSON shape this method expects.
-    #[error("could not decode the Hydromancer API response: {source}")]
+    #[error("could not decode the Hydromancer API response: {message}")]
     #[non_exhaustive]
     Decode {
-        /// The underlying JSON error.
-        #[source]
-        source: serde_json::Error,
+        /// What did not match, from the JSON parser.
+        message: String,
         /// The start of the response body (truncated to 4 KiB).
         body: String,
     },
