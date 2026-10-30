@@ -45,7 +45,8 @@ async fn main() -> Result<(), hydromancer::Error> {
 ```
 
 `Client::new("key")` takes the key directly, and `Client::builder()` sets the base URL,
-User-Agent, timeout and retry policy.
+User-Agent, timeout and retry policy. Base URLs must use `https` (plain `http` is accepted only
+for `localhost`, for local testing).
 
 ## Endpoints
 
@@ -107,6 +108,8 @@ async fn main() -> Result<(), hydromancer::Error> {
 ```
 
 Call `next_page` instead to handle one page at a time, and `cursor` to save where you stopped.
+If a full page fails to move the cursor forward, `next_page` returns `Error::PaginationStalled`
+instead of stopping quietly.
 
 ## Liquidations and candles
 
@@ -139,10 +142,12 @@ async fn main() -> Result<(), hydromancer::Error> {
 
 Each key has a per-minute weight budget, and heavier endpoints cost more weight
 ([details](https://docs.hydromancer.xyz/readme/rest-api/rate-limits-and-user-limits)).
-On HTTP 429 the client waits and retries, up to 3 times within 90 seconds by default. Each wait is
-the `Retry-After` header (seconds or an HTTP date), or the body's `retryAfterSecs`, or exponential
-backoff from 1 second capped at 30 seconds, plus up to 1 second of random jitter. When retries run
-out you get `Error::RateLimited` with the server's `remaining`, `required` and `correlationId`.
+On HTTP 429 the client waits and retries, up to 3 times by default. Each wait is the `Retry-After`
+header (seconds or an HTTP date), or the body's `retryAfterSecs`, or exponential backoff from
+1 second capped at 30 seconds, plus up to 1 second of random jitter. All attempts and waits share a
+90-second budget: a wait that would not fit is not attempted, and a request still running when the
+budget ends is cancelled. When retries run out you get `Error::RateLimited` with the server's
+`remaining`, `required` and `correlationId`; a request cut off by the budget gives `Error::Timeout`.
 Other errors are not retried. Change this with `ClientBuilder::retry_policy` or `max_retries`.
 
 ## Testnet
@@ -159,9 +164,11 @@ Your key needs testnet access; a 401 on testnet means it is not enabled for that
 
 ## API key handling
 
-The key is read from `HYDROMANCER_API_KEY` or passed in code, sent only as an `Authorization: Bearer`
-header to the configured base URL, and marked sensitive in the header map. `Debug` output and
-error messages never include it.
+The key is read from `HYDROMANCER_API_KEY` or passed in code and sent as an `Authorization: Bearer`
+header to `{base URL}/info`, marked sensitive in the header map. The built-in HTTP client does not
+follow redirects; if you pass your own `reqwest::Client` with `http_client`, configure it with
+`redirect::Policy::none()` as well. `Debug` output and the crate's own error messages never include
+the key, and it is masked if a server response echoes it back.
 
 Every request carries a `User-Agent` (`hydromancer-rs/<version>` by default), because the API rejects
 some default HTTP-library agents with HTTP 403 "error code: 1010".

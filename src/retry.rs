@@ -70,7 +70,7 @@ impl RetryPolicy {
     }
 
     pub(crate) fn jitter(&self) -> Duration {
-        self.max_jitter.mul_f64(fastrand::f64())
+        Duration::try_from_secs_f64(self.max_jitter.as_secs_f64() * fastrand::f64()).unwrap_or(self.max_jitter)
     }
 }
 
@@ -90,9 +90,7 @@ impl RateLimitBody {
     }
 
     pub(crate) fn retry_after(&self) -> Option<Duration> {
-        self.retry_after_secs
-            .filter(|s| s.is_finite() && *s >= 0.0)
-            .map(Duration::from_secs_f64)
+        self.retry_after_secs.and_then(|s| Duration::try_from_secs_f64(s).ok())
     }
 }
 
@@ -103,10 +101,7 @@ pub(crate) fn retry_after_header(headers: &HeaderMap, now: SystemTime) -> Option
         return Some(Duration::from_secs(secs));
     }
     if let Ok(secs) = value.parse::<f64>() {
-        if secs.is_finite() && secs >= 0.0 {
-            return Some(Duration::from_secs_f64(secs));
-        }
-        return None;
+        return Duration::try_from_secs_f64(secs).ok();
     }
     let at = httpdate::parse_http_date(value).ok()?;
     Some(at.duration_since(now).unwrap_or(Duration::ZERO))
@@ -153,6 +148,11 @@ mod tests {
     fn retry_after_garbage_and_missing() {
         assert_eq!(retry_after_header(&headers("soon"), SystemTime::now()), None);
         assert_eq!(retry_after_header(&headers("-3"), SystemTime::now()), None);
+        assert_eq!(retry_after_header(&headers("1e300"), SystemTime::now()), None);
+        assert_eq!(
+            retry_after_header(&headers("18446744073709551615"), SystemTime::now()),
+            Some(Duration::from_secs(u64::MAX))
+        );
         assert_eq!(retry_after_header(&HeaderMap::new(), SystemTime::now()), None);
     }
 
@@ -163,6 +163,13 @@ mod tests {
         assert_eq!((b.remaining, b.required), (Some(8), Some(20)));
         assert_eq!(b.correlation_id.as_deref(), Some("AB12"));
         assert!(RateLimitBody::parse(b"not json").retry_after().is_none());
+        // Unrepresentable values are ignored instead of panicking.
+        assert!(RateLimitBody::parse(br#"{"retryAfterSecs":1e300}"#)
+            .retry_after()
+            .is_none());
+        assert!(RateLimitBody::parse(br#"{"retryAfterSecs":-1}"#)
+            .retry_after()
+            .is_none());
     }
 
     #[test]
@@ -181,5 +188,12 @@ mod tests {
         for _ in 0..100 {
             assert!(p.jitter() <= p.max_jitter);
         }
+        let huge = RetryPolicy {
+            max_jitter: Duration::MAX,
+            initial_backoff: Duration::MAX,
+            ..RetryPolicy::default()
+        };
+        let _ = huge.jitter();
+        assert_eq!(huge.wait(None, 5), huge.max_backoff);
     }
 }

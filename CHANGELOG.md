@@ -8,3 +8,5 @@ First release.
 - Typed helpers: `clearinghouseState`, `batchClearinghouseStates`, `userFillsByTime` (with a cursor paginator), `liquidationHistoryByTime`, `candleSnapshot`, `apiUsage`.
 - `info` / `info_as` for any other JSON endpoint.
 - HTTP 429 retries using `Retry-After`, then `retryAfterSecs`, then exponential backoff with jitter.
+- All attempts and waits share a time budget (default 90 s); `Error::Timeout` when it runs out.
+- `userFillsByTime` paging returns `Error::PaginationStalled` instead of stopping silently if the cursor does not advance.

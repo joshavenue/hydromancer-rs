@@ -23,5 +23,8 @@ pub use types::{
     CumFunding, Fill, Leverage, Liquidation, LiquidationDetail, MarginSummary, Position,
 };
 
+/// Re-export of the `reqwest` version this crate uses, for
+/// [`ClientBuilder::http_client`] and [`Error::Transport`].
+pub use reqwest;
 /// Re-export of the `serde_json` version used for [`Client::info`] values.
 pub use serde_json;

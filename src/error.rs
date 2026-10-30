@@ -36,6 +36,7 @@ pub enum Error {
 
     /// The API answered with a non-success status other than 429.
     #[error("Hydromancer API returned HTTP {status}: {message}")]
+    #[non_exhaustive]
     Api {
         /// HTTP status code.
         status: u16,
@@ -48,6 +49,7 @@ pub enum Error {
     /// HTTP 429 that was still returned after the configured retries, or
     /// whose wait would not fit in the remaining retry budget.
     #[error("rate limited by the Hydromancer API after {attempts} attempt(s){}", fmt_retry(.retry_after))]
+    #[non_exhaustive]
     RateLimited {
         /// How many requests were sent in total.
         attempts: u32,
@@ -63,8 +65,27 @@ pub enum Error {
         correlation_id: Option<String>,
     },
 
+    /// The request (including 429 retries and waits) did not finish within
+    /// [`RetryPolicy::budget`](crate::RetryPolicy::budget).
+    #[error("the request did not complete within the {budget:?} budget")]
+    #[non_exhaustive]
+    Timeout {
+        /// The configured budget.
+        budget: Duration,
+    },
+
+    /// A full `userFillsByTime` page did not move the cursor forward, so
+    /// paging cannot continue without skipping or repeating fills.
+    #[error("userFillsByTime pagination stalled at cursor {cursor}")]
+    #[non_exhaustive]
+    PaginationStalled {
+        /// The cursor of the last fill on the stalled page.
+        cursor: String,
+    },
+
     /// The response body was not the JSON shape this method expects.
     #[error("could not decode the Hydromancer API response: {source}")]
+    #[non_exhaustive]
     Decode {
         /// The underlying JSON error.
         #[source]

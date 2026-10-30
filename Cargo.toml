@@ -2,7 +2,7 @@
 name = "hydromancer"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Async Rust client for the Hydromancer REST API: Hyperliquid positions, fills, liquidations and candles"
 license = "MIT"
 readme = "README.md"
@@ -11,7 +11,7 @@ homepage = "https://docs.hydromancer.xyz"
 documentation = "https://docs.rs/hydromancer"
 keywords = ["hyperliquid", "hydromancer", "trading", "market-data", "api-client"]
 categories = ["api-bindings", "finance"]
-include = ["src/**/*.rs", "examples/**/*.rs", "Cargo.toml", "README.md", "LICENSE", "CHANGELOG.md"]
+include = ["src/**/*.rs", "tests/**/*.rs", "Cargo.toml", "README.md", "LICENSE", "CHANGELOG.md"]
 
 [dependencies]
 fastrand = "2.3"

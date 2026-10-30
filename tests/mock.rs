@@ -168,6 +168,9 @@ async fn batch_all_dexes_shape_and_limit() {
 /// Responds to userFillsByTime like the server: cursor is exclusive, pages of `limit`.
 struct FillsServer {
     fills: Vec<Value>,
+    /// `true`: the next page starts after the cursor (what the live API does).
+    /// `false`: the page repeats the cursor fill, to exercise de-duplication.
+    exclusive: bool,
 }
 
 impl Respond for FillsServer {
@@ -179,10 +182,16 @@ impl Respond for FillsServer {
                 assert!(body.get("startTime").is_none(), "startTime sent with cursor");
                 let (t, i) = c.split_once('_').unwrap();
                 let key = (t.parse::<u64>().unwrap(), i.parse::<u64>().unwrap());
-                // Deliberately overlap by one record to exercise de-duplication.
                 self.fills
                     .iter()
-                    .position(|f| (f["time"].as_u64().unwrap(), f["txIndex"].as_u64().unwrap()) >= key)
+                    .position(|f| {
+                        let k = (f["time"].as_u64().unwrap(), f["txIndex"].as_u64().unwrap());
+                        if self.exclusive {
+                            k > key
+                        } else {
+                            k >= key
+                        }
+                    })
                     .unwrap_or(self.fills.len())
             }
             None => 0,
@@ -199,7 +208,10 @@ async fn paginator_follows_cursor_and_dedupes() {
     Mock::given(body_partial_json(
         json!({"type": "userFillsByTime", "user": USER, "limit": 3}),
     ))
-    .respond_with(FillsServer { fills })
+    .respond_with(FillsServer {
+        fills,
+        exclusive: false,
+    })
     .mount(&server)
     .await;
 
@@ -229,6 +241,7 @@ async fn paginator_stops_on_empty_page_and_respects_max_pages() {
     Mock::given(path("/info"))
         .respond_with(FillsServer {
             fills: (0..10).map(|i| fill(2000 + i, 0, 900 + i)).collect(),
+            exclusive: false,
         })
         .mount(&server)
         .await;
@@ -537,4 +550,145 @@ async fn errors_never_contain_the_key() {
     let err = client(&server).info(&json!({"type": "x"})).await.unwrap_err();
     assert!(!err.to_string().contains(KEY));
     assert!(!format!("{err:?}").contains(KEY));
+}
+
+#[tokio::test]
+async fn paginator_with_exclusive_cursor_and_limit_one() {
+    let server = MockServer::start().await;
+    Mock::given(path("/info"))
+        .respond_with(FillsServer {
+            fills: (0..4).map(|i| fill(3000 + i, 0, 700 + i)).collect(),
+            exclusive: true,
+        })
+        .mount(&server)
+        .await;
+    let mut pages = client(&server).user_fills_pages(UserFillsByTime::new(USER, 1).limit(1));
+    let all = pages.collect_pages(100).await.unwrap();
+    assert_eq!(all.iter().map(|f| f.tid).collect::<Vec<_>>(), vec![700, 701, 702, 703]);
+    assert!(pages.is_done());
+}
+
+#[tokio::test]
+async fn paginator_reports_a_stalled_cursor() {
+    let server = MockServer::start().await;
+    // Inclusive cursor with one fill per page: the cursor can never move.
+    Mock::given(path("/info"))
+        .respond_with(FillsServer {
+            fills: (0..4).map(|i| fill(4000 + i, 0, 800 + i)).collect(),
+            exclusive: false,
+        })
+        .mount(&server)
+        .await;
+    let mut pages = client(&server).user_fills_pages(UserFillsByTime::new(USER, 1).limit(1));
+    assert_eq!(pages.next_page().await.unwrap().unwrap().len(), 1);
+    let err = pages.next_page().await.unwrap_err();
+    assert!(
+        matches!(err, Error::PaginationStalled { ref cursor, .. } if cursor == "4000_0"),
+        "{err:?}"
+    );
+    assert!(pages.is_done());
+}
+
+#[tokio::test]
+async fn budget_bounds_slow_responses() {
+    let server = MockServer::start().await;
+    Mock::given(path("/info"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
+        .mount(&server)
+        .await;
+    let mut retry = RetryPolicy::default();
+    retry.budget = Duration::from_millis(300);
+    let c = Client::builder()
+        .api_key(KEY)
+        .base_url(server.uri())
+        .http_client(reqwest::Client::new()) // no timeout of its own
+        .retry_policy(retry)
+        .build()
+        .unwrap();
+    let started = Instant::now();
+    let err = c.info(&json!({"type": "x"})).await.unwrap_err();
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(matches!(err, Error::Timeout { .. }), "{err:?}");
+}
+
+#[tokio::test]
+async fn slow_retry_after_429_returns_the_rate_limit_error() {
+    let server = MockServer::start().await;
+    Mock::given(path("/info"))
+        .respond_with(SlowAfter429 {
+            calls: Default::default(),
+        })
+        .mount(&server)
+        .await;
+    let mut retry = RetryPolicy::default();
+    retry.budget = Duration::from_millis(500);
+    retry.max_jitter = Duration::ZERO;
+    let c = Client::builder()
+        .api_key(KEY)
+        .base_url(server.uri())
+        .retry_policy(retry)
+        .build()
+        .unwrap();
+    let err = c.info(&json!({"type": "x"})).await.unwrap_err();
+    assert!(
+        matches!(err, Error::RateLimited { attempts: 1, ref correlation_id, .. } if correlation_id.as_deref() == Some("C1")),
+        "{err:?}"
+    );
+}
+
+struct SlowAfter429 {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl Respond for SlowAfter429 {
+    fn respond(&self, _: &Request) -> ResponseTemplate {
+        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "0")
+                .set_body_json(json!({"correlationId": "C1"}))
+        } else {
+            ResponseTemplate::new(200).set_delay(Duration::from_secs(5))
+        }
+    }
+}
+
+#[tokio::test]
+async fn huge_retry_after_does_not_panic() {
+    let server = MockServer::start().await;
+    Mock::given(path("/info"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "18446744073709551615")
+                .set_body_json(json!({"retryAfterSecs": 1e300})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let err = client(&server).info(&json!({"type": "x"})).await.unwrap_err();
+    assert!(matches!(err, Error::RateLimited { attempts: 1, .. }), "{err:?}");
+}
+
+#[tokio::test]
+async fn redirects_are_not_followed() {
+    let server = MockServer::start().await;
+    Mock::given(path("/info"))
+        .respond_with(ResponseTemplate::new(307).insert_header("location", "https://elsewhere.example/info"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let err = client(&server).info(&json!({"type": "x"})).await.unwrap_err();
+    assert_eq!(err.status(), Some(307));
+}
+
+#[tokio::test]
+async fn echoed_key_is_redacted_from_errors() {
+    let server = MockServer::start().await;
+    Mock::given(path("/info"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(json!({"error": format!("bad token {KEY}")})))
+        .mount(&server)
+        .await;
+    let err = client(&server).info(&json!({"type": "x"})).await.unwrap_err();
+    let text = format!("{err} {err:?}");
+    assert!(!text.contains(KEY), "{text}");
+    assert!(text.contains("<redacted>"));
 }

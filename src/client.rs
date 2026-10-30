@@ -48,7 +48,8 @@ pub struct Client {
 struct Inner {
     http: reqwest::Client,
     base_url: String,
-    info_url: String,
+    info_url: reqwest::Url,
+    key: String,
     auth: HeaderValue,
     user_agent: HeaderValue,
     retry: RetryPolicy,
@@ -185,13 +186,33 @@ impl ClientBuilder {
         let mut auth = HeaderValue::from_str(&format!("Bearer {key}")).map_err(|_| Error::InvalidApiKey)?;
         auth.set_sensitive(true);
 
-        let base_url = self.base_url.trim().trim_end_matches('/').to_owned();
-        let parsed = reqwest::Url::parse(&base_url).map_err(|e| Error::InvalidBaseUrl(format!("{base_url}: {e}")))?;
-        if !matches!(parsed.scheme(), "http" | "https") {
+        let raw = self.base_url.trim();
+        let mut info_url = reqwest::Url::parse(raw).map_err(|e| Error::InvalidBaseUrl(format!("{raw}: {e}")))?;
+        match info_url.scheme() {
+            "https" => {}
+            "http" if is_loopback(&info_url) => {}
+            "http" => {
+                return Err(Error::InvalidBaseUrl(format!(
+                    "{raw}: plain http is only allowed for localhost; use https"
+                )))
+            }
+            _ => return Err(Error::InvalidBaseUrl(format!("{raw}: scheme must be https"))),
+        }
+        if !info_url.username().is_empty()
+            || info_url.password().is_some()
+            || info_url.query().is_some()
+            || info_url.fragment().is_some()
+        {
             return Err(Error::InvalidBaseUrl(format!(
-                "{base_url}: scheme must be http or https"
+                "{raw}: must not contain credentials, a query or a fragment"
             )));
         }
+        let base_url = info_url.as_str().trim_end_matches('/').to_owned();
+        info_url
+            .path_segments_mut()
+            .map_err(|_| Error::InvalidBaseUrl(format!("{raw}: cannot be a base URL")))?
+            .pop_if_empty()
+            .push("info");
 
         let ua = self.user_agent.trim();
         if ua.is_empty() {
@@ -211,8 +232,9 @@ impl ClientBuilder {
         Ok(Client {
             inner: Arc::new(Inner {
                 http,
-                info_url: format!("{base_url}/info"),
+                info_url,
                 base_url,
+                key: key.to_owned(),
                 auth,
                 user_agent,
                 retry: self.retry,
@@ -280,7 +302,7 @@ impl Client {
         let bytes = self.post(body).await?;
         serde_json::from_slice(&bytes).map_err(|source| Error::Decode {
             source,
-            body: snippet(&bytes),
+            body: redact(snippet(&bytes), &self.inner.key),
         })
     }
 
@@ -465,47 +487,89 @@ impl Client {
 
     async fn post(&self, body: Vec<u8>) -> Result<Vec<u8>> {
         let inner = &*self.inner;
+        let policy = &inner.retry;
         let started = Instant::now();
+        let deadline = started.checked_add(policy.budget).map(tokio::time::Instant::from_std);
         let mut attempts: u32 = 0;
+        let mut last_rate_limit: Option<Error> = None;
         loop {
             attempts += 1;
-            let response = inner
-                .http
-                .post(&inner.info_url)
-                .header(AUTHORIZATION, inner.auth.clone())
-                .header(USER_AGENT, inner.user_agent.clone())
-                .header(CONTENT_TYPE, "application/json")
-                .header(ACCEPT, "application/json")
-                .body(body.clone())
-                .send()
-                .await?;
-            let status = response.status();
-            let headers = response.headers().clone();
-            let bytes = response.bytes().await?;
+            let attempt = async {
+                let response = inner
+                    .http
+                    .post(inner.info_url.clone())
+                    .header(AUTHORIZATION, inner.auth.clone())
+                    .header(USER_AGENT, inner.user_agent.clone())
+                    .header(CONTENT_TYPE, "application/json")
+                    .header(ACCEPT, "application/json")
+                    .body(body.clone())
+                    .send()
+                    .await?;
+                let status = response.status();
+                let headers = response.headers().clone();
+                let bytes = response.bytes().await?;
+                Ok::<_, reqwest::Error>((status, headers, bytes))
+            };
+            let outcome = match deadline {
+                Some(deadline) => match tokio::time::timeout_at(deadline, attempt).await {
+                    Ok(outcome) => outcome,
+                    Err(_) => {
+                        return Err(last_rate_limit
+                            .take()
+                            .unwrap_or(Error::Timeout { budget: policy.budget }))
+                    }
+                },
+                None => attempt.await,
+            };
+            let (status, headers, bytes) = outcome?;
 
             if status.is_success() {
                 return Ok(bytes.to_vec());
             }
             if status != StatusCode::TOO_MANY_REQUESTS {
-                return Err(api_error(status, &bytes));
+                return Err(api_error(status, &bytes, &inner.key));
             }
 
             let rl = RateLimitBody::parse(&bytes);
             let hint = retry_after_header(&headers, SystemTime::now()).or_else(|| rl.retry_after());
+            let error = Error::RateLimited {
+                attempts,
+                retry_after: hint,
+                remaining: rl.remaining,
+                required: rl.required,
+                limit: header_u64(&headers, "x-ratelimit-limit"),
+                correlation_id: rl.correlation_id.map(|id| redact(id, &inner.key)),
+            };
             let retry = attempts - 1;
-            let wait = inner.retry.wait(hint, retry) + inner.retry.jitter();
-            if retry >= inner.retry.max_retries || started.elapsed() + wait > inner.retry.budget {
-                return Err(Error::RateLimited {
-                    attempts,
-                    retry_after: hint,
-                    remaining: rl.remaining,
-                    required: rl.required,
-                    limit: header_u64(&headers, "x-ratelimit-limit"),
-                    correlation_id: rl.correlation_id,
-                });
+            let wait = policy.wait(hint, retry).saturating_add(policy.jitter());
+            let remaining = policy.budget.saturating_sub(started.elapsed());
+            if retry >= policy.max_retries || wait > remaining {
+                return Err(error);
             }
+            last_rate_limit = Some(error);
             tokio::time::sleep(wait).await;
         }
+    }
+}
+
+fn is_loopback(url: &reqwest::Url) -> bool {
+    let host = url.host_str().unwrap_or_default();
+    host.eq_ignore_ascii_case("localhost")
+        || host.to_ascii_lowercase().ends_with(".localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Removes the API key from text that came from the server, in case a proxy echoes it.
+fn redact(text: String, key: &str) -> String {
+    // Very short keys would mangle ordinary text; real keys are much longer.
+    if key.len() >= 8 && text.contains(key) {
+        text.replace(key, "<redacted>")
+    } else {
+        text
     }
 }
 
@@ -524,8 +588,8 @@ fn check_batch<U: AsRef<str>>(users: &[U], max: usize) -> Result<Vec<&str>> {
     Ok(users.iter().map(AsRef::as_ref).collect())
 }
 
-fn api_error(status: StatusCode, bytes: &[u8]) -> Error {
-    let body = snippet(bytes);
+fn api_error(status: StatusCode, bytes: &[u8], key: &str) -> Error {
+    let body = redact(snippet(bytes), key);
     let message = serde_json::from_slice::<Value>(bytes)
         .ok()
         .and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_owned))
@@ -538,7 +602,7 @@ fn api_error(status: StatusCode, bytes: &[u8]) -> Error {
         });
     Error::Api {
         status: status.as_u16(),
-        message,
+        message: redact(message, key),
         body,
     }
 }
@@ -553,8 +617,10 @@ fn snippet(bytes: &[u8]) -> String {
 /// Each call to [`next_page`](Self::next_page) sends one request with the
 /// cursor of the previous page's last fill and returns only fills not seen
 /// before (keyed on trade id and order id, so both sides of a self-trade are
-/// kept). Paging stops after a short or empty page, or if the cursor stops
-/// moving.
+/// kept). The server's cursor is exclusive: the next page starts after the
+/// cursor fill. Paging stops after a short or empty page. If a full page does
+/// not move the cursor forward, [`next_page`](Self::next_page) returns
+/// [`Error::PaginationStalled`] rather than stopping silently.
 #[derive(Debug)]
 pub struct UserFillsPages {
     client: Client,
@@ -599,9 +665,21 @@ impl UserFillsPages {
             return Ok(None);
         };
         let next = last.cursor();
-        if page.len() < self.page_size || self.cursor.as_deref() == Some(next.as_str()) {
-            self.done = true;
+        let short = page.len() < self.page_size;
+        if !short {
+            let stalled = match self.cursor.as_deref() {
+                Some(current) => match parse_cursor(current) {
+                    Some(current) => (last.time, last.tx_index) <= current,
+                    None => current == next,
+                },
+                None => false,
+            };
+            if stalled {
+                self.done = true;
+                return Err(Error::PaginationStalled { cursor: next });
+            }
         }
+        self.done = short;
         self.cursor = Some(next);
 
         let fresh = page.into_iter().filter(|f| self.seen.insert((f.tid, f.oid))).collect();
@@ -639,6 +717,11 @@ impl UserFillsPages {
     }
 }
 
+fn parse_cursor(cursor: &str) -> Option<(u64, u64)> {
+    let (time, tx_index) = cursor.split_once('_')?;
+    Some((time.parse().ok()?, tx_index.parse().ok()?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -673,13 +756,48 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(c.base_url(), "http://localhost:1234");
-        assert_eq!(c.inner.info_url, "http://localhost:1234/info");
+        assert_eq!(c.inner.info_url.as_str(), "http://localhost:1234/info");
+        let c = Client::builder()
+            .api_key("k")
+            .base_url("https://proxy.example/hl")
+            .build()
+            .unwrap();
+        assert_eq!(c.inner.info_url.as_str(), "https://proxy.example/hl/info");
+        for bad in [
+            "http://api.example.com",
+            "https://user:pw@api.example.com",
+            "https://api.example.com/?token=x",
+            "https://api.example.com/#f",
+        ] {
+            assert!(
+                matches!(
+                    Client::builder().api_key("k").base_url(bad).build(),
+                    Err(Error::InvalidBaseUrl(_))
+                ),
+                "{bad}"
+            );
+        }
+        for ok in ["http://127.0.0.1:9", "http://[::1]:9", "http://LOCALHOST:9"] {
+            assert!(Client::builder().api_key("k").base_url(ok).build().is_ok(), "{ok}");
+        }
         let c = Client::builder().api_key("k").testnet().build().unwrap();
         assert_eq!(c.base_url(), TESTNET_URL);
         assert!(matches!(
             Client::builder().api_key("k").base_url("ftp://x").build(),
             Err(Error::InvalidBaseUrl(_))
         ));
+    }
+
+    #[test]
+    fn server_text_is_redacted() {
+        let e = api_error(
+            StatusCode::UNAUTHORIZED,
+            br#"{"error":"bad key secret-123"}"#,
+            "secret-123",
+        );
+        assert!(!format!("{e} {e:?}").contains("secret-123"));
+        assert_eq!(parse_cursor("1793066136762_10"), Some((1793066136762, 10)));
+        assert_eq!(parse_cursor("garbage"), None);
     }
 
     #[test]
@@ -702,9 +820,13 @@ mod tests {
 
     #[test]
     fn api_error_uses_error_field() {
-        let e = api_error(StatusCode::BAD_REQUEST, br#"{"error":"Unknown API route: x"}"#);
+        let e = api_error(
+            StatusCode::BAD_REQUEST,
+            br#"{"error":"Unknown API route: x"}"#,
+            "test-key-123",
+        );
         assert!(matches!(e, Error::Api { status: 400, ref message, .. } if message == "Unknown API route: x"));
-        let e = api_error(StatusCode::FORBIDDEN, b"error code: 1010");
+        let e = api_error(StatusCode::FORBIDDEN, b"error code: 1010", "test-key-123");
         assert!(matches!(e, Error::Api { status: 403, ref message, .. } if message == "error code: 1010"));
     }
 }

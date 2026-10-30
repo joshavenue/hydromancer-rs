@@ -116,6 +116,9 @@ pub struct Leverage {
     /// Raw USD for isolated positions.
     #[serde(default)]
     pub raw_usd: Option<String>,
+    /// Fields not modelled above.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 /// Cumulative funding of a [`Position`].
@@ -129,6 +132,9 @@ pub struct CumFunding {
     pub since_open: String,
     /// Since the position size last changed.
     pub since_change: String,
+    /// Fields not modelled above.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 /// Response of `batchClearinghouseStates`.
@@ -143,6 +149,9 @@ pub struct BatchClearinghouseStates<S = ClearinghouseState> {
     /// Addresses that could not be fetched.
     #[serde(default)]
     pub failed_wallets: Vec<String>,
+    /// Fields not modelled above.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 /// Clearinghouse state per DEX (`"native"` plus each HIP-3 DEX), as returned with `"dex": "ALL_DEXES"`.
@@ -182,7 +191,7 @@ pub struct Fill {
     /// Fee paid (negative for a rebate).
     #[serde(default)]
     pub fee: Option<String>,
-    /// Trade id; the paginator de-duplicates on it.
+    /// Trade id. The paginator de-duplicates on trade id plus order id.
     pub tid: u64,
     /// Client order id.
     #[serde(default)]
@@ -246,6 +255,9 @@ pub struct LiquidationDetail {
     pub mark_px: String,
     /// `"market"` (closed against the book) or `"backstop"` (taken by the backstop liquidator).
     pub method: String,
+    /// Fields not modelled above.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 /// An OHLCV candle (`candleSnapshot`).
